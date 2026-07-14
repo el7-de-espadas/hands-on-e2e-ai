@@ -1,6 +1,7 @@
 from google import genai
 from google.genai import types
 import os
+import cohere
 from qdrant_client import QdrantClient
 from langsmith import traceable, get_current_run_tree
 import instructor
@@ -41,28 +42,36 @@ def get_embeddings(text, task_type="SEMANTIC_SIMILARITY", model="gemini-embeddin
     name="retrieve_data",
     run_type="retriever"
 )
-def retrieve_data(query, qdrant_client, k=5):
+def retrieve_data(query, qdrant_client, k=5, hybrid_search=True):
     query_embedding = get_embeddings(query)
-    results = qdrant_client.query_points(
-        collection_name="Amazon-items-collection-01-hybrid-search",
-        prefetch=[
-            Prefetch(
-                query=query_embedding,
-                using="gemini-embedding-001",
-                limit=20
-            ),
-            Prefetch(
-                query=Document(
-                    text=query,
-                    model="qdrant/bm25"
+    if hybrid_search:
+        results = qdrant_client.query_points(
+            collection_name="Amazon-items-collection-01-hybrid-search",
+            prefetch=[
+                Prefetch(
+                    query=query_embedding,
+                    using="gemini-embedding-001",
+                    limit=20
                 ),
-                using="bm25",
-                limit=20
-            )
-        ],
-        query=models.RrfQuery(rrf=models.Rrf(weights=[3,1])),
-        limit=k
-    )
+                Prefetch(
+                    query=Document(
+                        text=query,
+                        model="qdrant/bm25"
+                    ),
+                    using="bm25",
+                    limit=20
+                )
+            ],
+            query=models.RrfQuery(rrf=models.Rrf(weights=[3,1])),
+            limit=k
+        )
+    else:
+        results = qdrant_client.query_points(
+            collection_name="Amazon-items-collection-01-hybrid-search",
+            query=query_embedding,
+            using="gemini-embedding-001",
+            limit=k
+        )
     retrieved_context_ids=[]
     retrieved_context=[]
     similarity_scores=[]
@@ -79,6 +88,27 @@ def retrieve_data(query, qdrant_client, k=5):
         "retrieved_context": retrieved_context,
         "similarity_scores": similarity_scores,
         "retrieved_context_ratings": retrieved_context_ratings
+    }
+
+@traceable(
+    name="rerank_data",
+    run_type="tool"
+)
+def rerank_data(query, context, top_k=5):
+    cohere_client = cohere.ClientV2(api_key=os.getenv("COHERE_API_KEY"))
+    response = cohere_client.rerank(
+        model="rerank-v4.0-pro",
+        query=query,
+        documents=context["retrieved_context"],
+        top_n=top_k
+    )
+    order = [result.index for result in response.results]
+    
+    return {
+        "retrieved_context_ids": [context["retrieved_context_ids"][i] for i in order],
+        "retrieved_context": [context["retrieved_context"][i] for i in order],
+        "similarity_scores": [context["similarity_scores"][i] for i in order],
+        "retrieved_context_ratings": [context["retrieved_context_ratings"][i] for i in order]
     }
 
 ### Format retrieved context function
@@ -136,8 +166,12 @@ def generate_answer(prompt):
 @traceable(
     name="rag_pipeline"
 )
-def rag_pipeline(query, qdrant_client, topk_k=5):
-    retrieved_context = retrieve_data(query, qdrant_client, topk_k)
+def rag_pipeline(query, qdrant_client, topk_k=5, hybrid_search=True, rerank=False, retrieve_k=20):
+    retrieved_context = retrieve_data(query, qdrant_client, retrieve_k if rerank else topk_k, hybrid_search=hybrid_search)
+
+    if rerank:
+        retrieved_context = rerank_data(query, retrieved_context, top_k=topk_k)
+
     preprocessed_context = process_context(retrieved_context)
     prompt = build_prompt(query, preprocessed_context)
     answer = generate_answer(prompt)

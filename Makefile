@@ -17,7 +17,8 @@ run-docker-compose:
 clean-notebook-outputs:
 	juoyter nbconvert --clear-output --inplace notebooks/*/*.ipynb
 
-# run-evals-retriever:
-# 	uv sync
-#  	PYTHONPATH=${PWD}/apps/api:${PWD}apps/api/src:$$PYTHONPATH:${PWD} uv run --env-file .env python -m evals.eval_retriever
-# 	$env:PYTHONPATH="$PWD;$PWD\apps\api;$PWD\apps\api\src;$env:PYTHONPATH"; uv run --env-file .env python -m evals.eval_retriever
+### Still to be tested
+run-evals-retriever-extended:
+	uv sync
+	cd apps/api/src && uv run --env-file ../../../.env python -m evals.eval_retriever_extended
+#	cd apps/api/src && PYTHONPATH=${PWD}/apps/api:${PWD}/apps/api/src:$$PYTHONPATH:${PWD} uv run --env-file ../../../.env python -m evals.eval_retriever_extended
