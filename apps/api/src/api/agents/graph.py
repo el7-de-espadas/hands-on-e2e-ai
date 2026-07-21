@@ -4,10 +4,12 @@ from operator import add
 from api.agents.agents import RAGUsedContext, agent_node, intent_router_node
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
-from api.agents.tools import get_formatted_item_context 
+from api.agents.tools import get_formatted_item_context, get_formatted_reviews_context
 from langchain_core.messages import HumanMessage
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from langgraph.checkpoint.postgres import PostgresSaver
+import json
 
 class State(BaseModel):
     messages: Annotated[List[Any], add] = []
@@ -16,6 +18,7 @@ class State(BaseModel):
     answer: str = ""
     final_answer: bool = False
     references: list[RAGUsedContext] = []
+    trace_id: str = ""
 
 ### Edges
 
@@ -41,7 +44,7 @@ def intent_router_conditional_edges(state: State) -> str:
 
 workflow = StateGraph(State)
 
-tools = [get_formatted_item_context]
+tools = [get_formatted_item_context, get_formatted_reviews_context]
 tool_node = ToolNode(tools)
 
 workflow.add_node("tool_node", tool_node)
@@ -70,22 +73,53 @@ workflow.add_conditional_edges(
 workflow.add_edge("tool_node", "agent_node")
 graph = workflow.compile()
 
-### Agent Execution
+## Agent Execution Wrapper
 
-def run_agent(query: str) -> dict:
+def agent_stream_wrapper(query: str, thread_id: str) -> dict:
+
+    def _string_for_sse(string):
+        return f"data: {string}\n\n"
+
+    def _process_graph_event(chunk):
+        def _is_node_start(chunk):
+            return chunk[1].get("type") == "task"
+        
+        def _tool_to_text(tool_call):
+            if tool_call.get("name") == "get_formatted_item_context":
+                return f"Looking for items: {tool_call.get('args').get('query', '')}"
+            elif tool_call.get("name") == "get_formatted_reviews_context":
+                return f"Fetching user reviews"
+        
+        if _is_node_start(chunk):
+            if chunk[1].get("payload",{}).get("name") == "intent_router_node":
+                return "Analysing the question..."
+            if chunk[1].get("payload",{}).get("name") == "agent_node":
+                return "Thinking..."
+            if chunk[1].get("payload",{}).get("name") == "tool_node":
+                message = " ".join([_tool_to_text(tool_call) for tool_call in chunk[1].get("payload",{}).get('input',{}).messages[-1].tool_calls])
+                return message
+
+    qdrant_client = QdrantClient(url="http://qdrant:6333")
     initial_state = {
         "messages": [HumanMessage(content=query)],
         "iteration": 0
     }
-    result = graph.invoke(initial_state)
-    return result
+    config = {
+        "configurable":{
+            "thread_id": thread_id
+            }
+    }
+    with PostgresSaver.from_conn_string(
+        "postgresql://langgraph_user:langgraph_password@postgres:5432/langgraph_db"
+    ) as checkpointer:
+        graph = workflow.compile(checkpointer=checkpointer)
+        for chunk in graph.stream(initial_state, config, stream_mode=["debug","values"]):
+            process_chunk=_process_graph_event(chunk)
+            if process_chunk:
+                yield _string_for_sse(process_chunk)
+            if chunk[0] == "values":
+                result = chunk[1]
 
-
-### Agent Execution Wrapper
-
-def agent_wrapper(query: str, top_k: int = 5) -> dict:
-    qdrant_client = QdrantClient(url="http://qdrant:6333")
-    result = run_agent(query)
     used_context = []
     for item in result.get("references",[]):
         payload = qdrant_client.scroll(
@@ -112,9 +146,15 @@ def agent_wrapper(query: str, top_k: int = 5) -> dict:
                 }
             )
 
-    return {
-        "answer": result.get("answer"),
-        "used_context": used_context
-    }
+    yield _string_for_sse(json.dumps(
+        {
+        "type": "final_answer",
+        "data": {
+            "answer": result.get("answer", ""),
+            "used_context": used_context,
+            "trace_id": result.get("trace_id", "")
+        }
+        }
+    ))
 
 

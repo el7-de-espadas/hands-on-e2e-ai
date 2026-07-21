@@ -7,7 +7,7 @@ import os
 from langchain_core.tools import tool
 from qdrant_client import QdrantClient
 from qdrant_client import models
-from qdrant_client.http.models import   Document, Prefetch
+from qdrant_client.http.models import   Document, Prefetch, Filter, FieldCondition, MatchAny, FusionQuery
 
 gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
@@ -33,7 +33,7 @@ def get_embeddings(text, task_type="SEMANTIC_SIMILARITY", model="gemini-embeddin
     name="retrieve_data",
     run_type="retriever"
 )
-def retrieve_data(query, qdrant_client, k=5, hybrid_search=True):
+def retrieve_items_data(query, qdrant_client, k=5, hybrid_search=True):
     query_embedding = get_embeddings(query)
     if hybrid_search:
         results = qdrant_client.query_points(
@@ -115,7 +115,15 @@ def process_context(context):
 
 @tool
 def get_formatted_item_context(query: str, top_k: int = 5) -> str:
-    """ Get the top k context, each representing an inventory item for a given query 
+    """ 
+    Search available products and return the top k inventory items
+
+    Expand the customer's question into 1-5 concise search statements and issue them in parallel in a single turn.
+    Each statement covers one distinct product or attribute; no two way express the same intent. Use natural product-description language.
+    If no brand or model is specified, search broadly rather than refusing.
+
+    "Earphones for me and a waterproof speaker" -> "Peronal earphones" | "Waterproof speaker"
+    "A warm winter jacket for hiking" -> "Insulated Winter jacket" | "Hiking outerwear for cold weather"
 
     Args:
         query: The query to get the context for
@@ -127,10 +135,88 @@ def get_formatted_item_context(query: str, top_k: int = 5) -> str:
 
     qdrant_client = QdrantClient(url="http://qdrant:6333")
 
-    retrieved_context = retrieve_data(query, qdrant_client, k=20)
+    retrieved_context = retrieve_items_data(query, qdrant_client, k=20)
 
     retrieved_context = rerank_data(query, retrieved_context, top_k=top_k)
 
     formatted_context = process_context(retrieved_context)
+
+    return formatted_context
+
+### Reviews retrieval tool
+@traceable(
+    name="retrieve_prefiltered_reviews_data",
+    run_type="retriever"
+)
+def retrieve_prefiltered_reviews_data(query, parent_asins, qdrant_client, k=5):
+    query_embedding = get_embeddings(query)
+    results = qdrant_client.query_points(
+            collection_name="Amazon-reviews-collection-01",
+            prefetch=[
+                Prefetch(
+                    query=query_embedding,
+                    using="gemini-embedding-001",
+                    filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="parent_asin",
+                                match=MatchAny(
+                                    any=parent_asins
+                                )
+                            )
+                        ]
+                    ),
+                    limit=20
+                )
+            ],
+            query=FusionQuery(fusion='rrf'),
+            limit=k
+    )
+    retrieved_context_ids=[]
+    retrieved_context=[]
+    similarity_scores=[]
+
+    for result in results.points:
+        retrieved_context_ids.append(result.payload["parent_asin"])
+        retrieved_context.append(result.payload["preprocessed_data"])
+        similarity_scores.append(result.score)
+
+    return {
+        "retrieved_context_ids": retrieved_context_ids,
+        "retrieved_context": retrieved_context,
+        "similarity_scores": similarity_scores,
+    }
+
+
+### Format retrieved context function
+@traceable(
+    name="format_retrieved_reviews_context",
+    run_type="prompt"
+)
+def process_reviews_context(context):
+    formatted_context = ""
+    for id, chunk in zip(context["retrieved_context_ids"], context["retrieved_context"]):
+        formatted_context += f"- ID: {id}, description: {chunk}\n"
+    return formatted_context
+
+
+@tool
+def get_formatted_reviews_context(query: str,parent_asins: list[str], top_k: int = 5) -> str:
+    """ 
+    Get the top k reviews matching a query for a list of prefiltered items
+
+    Args:
+        query: The query to get the context for
+        parent_asins: The list of parent ASINs to filter the context for
+        top_k: The number of context to return
+
+    Returns:
+        A string of the top k context chunks with IDs prepending for each chun, each representing a review for a given inventory item.
+    """
+    qdrant_client = QdrantClient(url="http://qdrant:6333")
+
+    retrieved_context = retrieve_prefiltered_reviews_data(query, parent_asins, qdrant_client, top_k)
+
+    formatted_context = process_reviews_context(retrieved_context)
 
     return formatted_context

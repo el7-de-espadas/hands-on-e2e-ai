@@ -208,6 +208,8 @@ __marimo__/
 
 #local data 
 qdrant_data/
+data/
+postgres_data
 
 # Large local datasets — download separately
 data/*.jsonl.gz

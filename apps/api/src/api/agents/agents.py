@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from langgraph.graph import StateGraph, START, END
 from operator import add
 from jinja2 import Template
-from langchain_core.messages import SystemMessage, HumanMessage, convert_to_openai_messages
+from langchain_core.messages import SystemMessage, HumanMessage, convert_to_openai_messages, AIMessage
 import instructor
 from langsmith import traceable
 from langsmith import get_current_run_tree
@@ -15,7 +15,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.tools import tool
 from api.core.config import config
 from api.agents.utils.prompt_management import prompt_template_config
-from api.agents.tools import get_formatted_item_context
+from api.agents.tools import get_formatted_item_context, get_formatted_reviews_context
 
 gemini_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
@@ -25,6 +25,10 @@ class RAGUsedContext(BaseModel):
     description: str = Field(description="   description of the item used to answer the question")
 
 class FinalResponse(BaseModel):
+
+
+    """ Call this tool when the final answer is possible using available context"""
+
     answer:str = Field(description="Answer to the question")
     references: list[RAGUsedContext] = Field(description="List of items used to answer the question")
 
@@ -51,7 +55,7 @@ def agent_node(state) -> dict:
     prompt = template.render()
 
     llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", client=gemini_client)
-    llm_with_tools = llm.bind_tools([get_formatted_item_context, FinalResponse], tool_choice="any")
+    llm_with_tools = llm.bind_tools([get_formatted_item_context, get_formatted_reviews_context, FinalResponse], tool_choice="required")
 
     response = llm_with_tools.invoke(
         [
@@ -71,12 +75,21 @@ def agent_node(state) -> dict:
     answer = ""
     references = []
 
+    def sanitise_response(response):
+
+        for tool_call in response.tool_calls:
+            if tool_call.get("name") == "FinalResponse":
+                answer = tool_call.get("args").get("answer")
+        
+        return AIMessage(content=answer)
+
     if len(response.tool_calls) > 0:
         for tool_call in response.tool_calls:
             if tool_call.get("name") == "FinalResponse":
                 final_answer = True
                 answer = tool_call.get("args").get("answer")
                 references.extend(tool_call.get("args").get("references"))
+                response = sanitise_response(response)
 
 
     return {
@@ -104,12 +117,12 @@ def intent_router_node(state) -> dict:
 
     messages = state.messages
     conversation = []
-    for message in messages:
-        conversation.append(convert_to_openai_messages(message))
+    conversation.append(convert_to_openai_messages(messages[-1]))
     client = instructor.from_genai(
     gemini_client,
     model="gemini-3.1-flash-lite"
     )
+
     response, raw_response = client.create_with_completion(
     messages=[
         {"role": "user", "content": prompt},
@@ -124,8 +137,14 @@ def intent_router_node(state) -> dict:
             "output_tokens": raw_response.usage_metadata.candidates_token_count,
             "total_tokens": raw_response.usage_metadata.total_token_count,
         }
+        trace_id = str(current_run.trace_id)
+
+    else:
+        trace_id = ""
+
 
     return {
         "question_relevant": response.question_relevant,
-        "answer": response.answer
+        "answer": response.answer,
+        "trace_id": trace_id
     }
